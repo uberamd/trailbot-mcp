@@ -1,21 +1,24 @@
 # trailbot-mcp
 
+[![Build Status](https://build.mnlab.cloud/api/badges/uberamd/trailbot-mcp/status.svg)](https://build.mnlab.cloud/uberamd/trailbot-mcp)
+
 A small MCP server (streamable HTTP) that answers "is <trail> open for riding?" from
 [Trailbot](https://trailbot.com/trails) data.
 
 ## How it gets data
 
-Trailbot is a Next.js site, and every page embeds its data as `__NEXT_DATA__` JSON. The
-server reads two kinds of page:
+- **Status** comes from Trailbot's public JSON API,
+  `https://trailbot.com/api/public/organizations/<org>/trails`, which returns each of that org's
+  trails with its status, condition tags, maintainer note and update time. It's the same data
+  Trailbot's pages show, and it's served with `Access-Control-Allow-Origin: *` for embedding
+  on other sites. Cached for 5 minutes per org.
+- **The trail index** (every trail's name, city, state, region and org, but no status) has no
+  public API. It comes from the `__NEXT_DATA__` JSON embedded in `https://trailbot.com/trails`.
+  Cached for 6 hours.
 
-- `https://trailbot.com/trails` is the index of about 330 trails, with name, city, state,
-  region and managing org, but no status. It is cached for 6 hours.
-- `https://trailbot.com/trails/<org>` has each of that org's trails with its current status
-  and maintainer note. It is cached for 5 minutes.
-
-Page URLs are stable. The `/_next/data/<buildId>/...json` endpoint is not, because its build
-ID changes on every Trailbot deploy. If Trailbot can't be reached, cached data is returned with
-a warning.
+The API is undocumented, so Trailbot could change it without notice. If either source
+changes shape, the tools return a clear error rather than wrong statuses. If Trailbot can't be
+reached, cached data is returned with a warning.
 
 ## Tools
 

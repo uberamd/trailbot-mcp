@@ -1,12 +1,12 @@
 """Fetch and interpret trail data from trailbot.com.
 
-Trailbot is a Next.js site; every page embeds its data in a
-<script id="__NEXT_DATA__"> JSON blob. We read that instead of
-/_next/data/<buildId>/... because the buildId changes on every Trailbot deploy.
-
-Two pages matter:
-  /trails        -> index of every trail (name, city, state, regions, org) but no status
-  /trails/<org>  -> that org's trails with current status
+Two sources:
+  /trails                                  -> index of every trail (name, city, state, regions,
+                                              org) but no status. A Next.js page; we read the
+                                              __NEXT_DATA__ JSON it embeds.
+  /api/public/organizations/<org>/trails   -> that org's trails with current status. Trailbot's
+                                              public (CORS-open) JSON API, the same data its
+                                              pages render.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 BASE_URL = "https://trailbot.com"
-USER_AGENT = "trailbot-mcp/0.2 (personal trail-status lookup)"
+USER_AGENT = "trailbot-mcp/0.3 (personal trail-status lookup)"
 
 _NEXT_DATA_RE = re.compile(
     r'<script id="__NEXT_DATA__" type="application/json"[^>]*>(.*?)</script>', re.S
@@ -198,13 +198,12 @@ class Trail:
         }
 
 
-def parse_org_page(html: str, org: str) -> list[Trail]:
-    props = _page_props(html, org)
+def parse_org_trails(body: str, org: str) -> list[Trail]:
     try:
-        raw_trails = props["trails"]
-    except KeyError as e:
-        raise TrailbotError(f"No trails in Trailbot page data for {org}") from e
-    return [Trail.from_raw(t, org) for t in raw_trails if t.get("active", True)]
+        raw_trails = json.loads(body)["trails"]
+        return [Trail.from_raw(t, org) for t in raw_trails if t.get("active", True)]
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+        raise TrailbotError(f"Unexpected response from Trailbot's public API for {org}: {e!r}") from e
 
 
 class _TTLCache:
@@ -271,6 +270,8 @@ class TrailbotClient:
         """Return (trails with status, stale) for one org."""
 
         async def fetch():
-            return parse_org_page(await self._get(f"/trails/{quote(org)}"), org)
+            return parse_org_trails(
+                await self._get(f"/api/public/organizations/{quote(org)}/trails"), org
+            )
 
         return await self.org_cache.get(org, fetch)
