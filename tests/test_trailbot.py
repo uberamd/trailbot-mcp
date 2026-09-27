@@ -243,3 +243,13 @@ async def test_list_trails_too_broad(mocked):
 
 async def test_list_trails_needs_place(mocked):
     assert "Which area" in (await server.list_trails())["summary"]
+
+
+async def test_healthz_reports_commit(monkeypatch):
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("GIT_COMMIT", "abc123")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "secret")
+    with TestClient(server.build_app()) as c:
+        assert c.get("/healthz").json() == {"status": "ok", "commit": "abc123"}
+        assert c.post("/mcp").status_code == 401  # healthz is public, MCP is not

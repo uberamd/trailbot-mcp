@@ -1,0 +1,201 @@
+kind: pipeline
+type: docker
+name: test_pr
+
+trigger:
+  event:
+    - pull_request
+
+steps:
+  # Restoring uv's package cache from S3-compatible storage turns a cold
+  # `uv sync` into a local one. Keyed on uv.lock so a dependency bump
+  # invalidates it automatically, and deliberately not on branch, so a PR gets
+  # main's cache instead of a cold one of its own.
+  - name: restore-uv-cache
+    image: meltwater/drone-cache:v1.4.0-linux-amd64
+    settings:
+      backend: "s3"
+      restore: true
+      cache_key: "uv-{{ checksum \"uv.lock\" }}"
+      archive_format: "gzip"
+      mount:
+        - .cache/uv
+      endpoint: http://10.7.5.107:9000
+      path_style: true
+      region: us-central-1
+      bucket: drone
+      access_key:
+        from_secret: s3_cache_access_key
+      secret_key:
+        from_secret: s3_cache_secret_key
+
+  - name: python
+    image: ghcr.io/astral-sh/uv:0.11-python3.13-trixie-slim
+    environment:
+      UV_CACHE_DIR: /drone/src/.cache/uv
+    depends_on:
+      - restore-uv-cache
+    commands:
+      # --locked fails if uv.lock is out of date with pyproject.toml.
+      - uv sync --locked
+      # The tests run against saved Trailbot pages in tests/fixtures, so they
+      # never hit trailbot.com and can't flake on it.
+      - uv run pytest -q
+
+  - name: rebuild-uv-cache
+    image: meltwater/drone-cache:v1.4.0-linux-amd64
+    depends_on:
+      - python
+    settings:
+      backend: "s3"
+      rebuild: true
+      cache_key: "uv-{{ checksum \"uv.lock\" }}"
+      archive_format: "gzip"
+      mount:
+        - .cache/uv
+      endpoint: http://10.7.5.107:9000
+      path_style: true
+      region: us-central-1
+      bucket: drone
+      access_key:
+        from_secret: s3_cache_access_key
+      secret_key:
+        from_secret: s3_cache_secret_key
+
+  # Build the image without pushing, so a broken Dockerfile fails the PR rather
+  # than the merge.
+  - name: docker-build
+    image: plugins/docker
+    depends_on:
+      - python
+    settings:
+      repo: harbor.mnlab.cloud/mnlab/trailbot-mcp
+      dockerfile: Dockerfile
+      dry_run: true
+
+---
+kind: pipeline
+type: docker
+name: test_main
+
+trigger:
+  branch:
+    - main
+  event:
+    - push
+    - custom
+
+steps:
+  - name: restore-uv-cache
+    image: meltwater/drone-cache:v1.4.0-linux-amd64
+    settings:
+      backend: "s3"
+      restore: true
+      cache_key: "uv-{{ checksum \"uv.lock\" }}"
+      archive_format: "gzip"
+      mount:
+        - .cache/uv
+      endpoint: http://10.7.5.107:9000
+      path_style: true
+      region: us-central-1
+      bucket: drone
+      access_key:
+        from_secret: s3_cache_access_key
+      secret_key:
+        from_secret: s3_cache_secret_key
+
+  - name: python
+    image: ghcr.io/astral-sh/uv:0.11-python3.13-trixie-slim
+    environment:
+      UV_CACHE_DIR: /drone/src/.cache/uv
+    depends_on:
+      - restore-uv-cache
+    commands:
+      - uv sync --locked
+      - uv run pytest -q
+
+  - name: rebuild-uv-cache
+    image: meltwater/drone-cache:v1.4.0-linux-amd64
+    depends_on:
+      - python
+    settings:
+      backend: "s3"
+      rebuild: true
+      cache_key: "uv-{{ checksum \"uv.lock\" }}"
+      archive_format: "gzip"
+      mount:
+        - .cache/uv
+      endpoint: http://10.7.5.107:9000
+      path_style: true
+      region: us-central-1
+      bucket: drone
+      access_key:
+        from_secret: s3_cache_access_key
+      secret_key:
+        from_secret: s3_cache_secret_key
+
+---
+kind: pipeline
+type: docker
+name: build_and_push
+
+# Only build and push an image once the tests have passed.
+depends_on:
+  - test_main
+
+trigger:
+  branch:
+    - main
+  event:
+    - push
+    - custom
+
+steps:
+  - name: generate-version
+    image: alpine:latest
+    commands:
+      # Derive the short SHA from Drone's built-in commit env and fail fast if missing.
+      - SHORT_SHA="$(printf '%s' "${DRONE_COMMIT_SHA:-}" | cut -c1-7)"
+      - test -n "$SHORT_SHA" || { echo "DRONE_COMMIT_SHA is empty; DRONE_COMMIT_SHA was not set" >&2; exit 1; }
+      # :latest is what Dokploy deploys; the short-SHA tag keeps each build
+      # addressable for rollback.
+      - printf 'latest,%s' "$SHORT_SHA" > .tags
+
+  - name: publish
+    image: plugins/docker
+    depends_on:
+      - generate-version
+    settings:
+      registry: harbor.mnlab.cloud
+      repo: harbor.mnlab.cloud/mnlab/trailbot-mcp
+      # Embedded in the image so /healthz reports which commit is running.
+      build_args_from_env:
+        - DRONE_COMMIT_SHA
+      dockerfile: Dockerfile
+      username:
+        from_secret: docker_username
+      password:
+        from_secret: docker_password
+
+---
+kind: pipeline
+type: docker
+name: deploy
+# Triggered by promoting a green main build; nothing here promotes on its own.
+# Dokploy's redeploy pulls harbor.mnlab.cloud/mnlab/trailbot-mcp:latest.
+
+trigger:
+  branch:
+    - main
+  event:
+    - promote
+
+steps:
+  - name: deploy
+    image: curlimages/curl:8.12.1
+    environment:
+      PAAS_DEPLOY_URL:
+        from_secret: paas_deploy_url
+    commands:
+      - 'test -n "${PAAS_DEPLOY_URL:-}" || { echo "paas_deploy_url secret is not set" >&2; exit 1; }'
+      - curl --fail --show-error --silent --request POST "$PAAS_DEPLOY_URL"

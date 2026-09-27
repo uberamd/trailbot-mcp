@@ -10,7 +10,7 @@ import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse
 
 from .lookup import ALL_WORDS, match_trails_scored, resolve_location, split_trail_and_place
 from .trailbot import Index, IndexTrail, Trail, TrailbotClient, TrailbotError
@@ -223,8 +223,8 @@ async def list_trails(location: str | None = None, status: str | None = None) ->
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
-async def healthz(_: Request) -> PlainTextResponse:
-    return PlainTextResponse("ok")
+async def healthz(_: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "commit": os.getenv("GIT_COMMIT", "dev")})
 
 
 class BearerAuth:
