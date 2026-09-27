@@ -197,5 +197,8 @@ steps:
       PAAS_DEPLOY_URL:
         from_secret: paas_deploy_url
     commands:
-      - 'test -n "${PAAS_DEPLOY_URL:-}" || { echo "paas_deploy_url secret is not set" >&2; exit 1; }'
+      # The doubled dollar sign stops Drone substituting this variable itself
+      # (as an empty string) before the shell sees the secret. Drone does that
+      # substitution across this whole file, comments included.
+      - 'test -n "$${PAAS_DEPLOY_URL:-}" || { echo "paas_deploy_url secret is not set" >&2; exit 1; }'
       - curl --fail --show-error --silent --request POST "$PAAS_DEPLOY_URL"
