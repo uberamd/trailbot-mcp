@@ -1,26 +1,29 @@
-"""Fetch and interpret trail status from trailbot.com.
+"""Fetch and interpret trail data from trailbot.com.
 
-Trailbot is a Next.js site. Each org page (https://trailbot.com/trails/<org>)
-embeds its full page data in a <script id="__NEXT_DATA__"> JSON blob. We read
-that instead of /_next/data/<buildId>/... because the buildId changes on every
-Trailbot deploy, while the page URL does not.
+Trailbot is a Next.js site; every page embeds its data in a
+<script id="__NEXT_DATA__"> JSON blob. We read that instead of
+/_next/data/<buildId>/... because the buildId changes on every Trailbot deploy.
+
+Two pages matter:
+  /trails        -> index of every trail (name, city, state, regions, org) but no status
+  /trails/<org>  -> that org's trails with current status
 """
 
 from __future__ import annotations
 
 import asyncio
-import difflib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
 
 BASE_URL = "https://trailbot.com"
-USER_AGENT = "trailbot-mcp/0.1 (personal trail-status lookup)"
+USER_AGENT = "trailbot-mcp/0.2 (personal trail-status lookup)"
 
 _NEXT_DATA_RE = re.compile(
     r'<script id="__NEXT_DATA__" type="application/json"[^>]*>(.*?)</script>', re.S
@@ -31,8 +34,72 @@ class TrailbotError(Exception):
     pass
 
 
+def _page_props(html: str, what: str) -> dict:
+    m = _NEXT_DATA_RE.search(html)
+    if not m:
+        raise TrailbotError(f"No __NEXT_DATA__ on the {what} page; Trailbot's page layout may have changed.")
+    try:
+        return json.loads(m.group(1))["props"]["pageProps"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise TrailbotError(f"Unexpected Trailbot page data for {what}: {e!r}") from e
+
+
+@dataclass
+class IndexTrail:
+    """A trail as listed on /trails: where it is and who manages it, but no status."""
+
+    name: str
+    slug: str
+    org: str
+    city: str
+    state: str
+    regions: list[str]
+
+
+@dataclass
+class Area:
+    code: str
+    name: str
+    regions: dict[str, str]  # region key -> display name
+
+
+@dataclass
+class Index:
+    trails: list[IndexTrail]
+    areas: dict[str, Area] = field(default_factory=dict)
+
+
+def parse_index(html: str) -> Index:
+    props = _page_props(html, "/trails")
+    try:
+        trails = [
+            IndexTrail(
+                name=(t.get("trailName") or t["slug"]).strip(),
+                slug=t["slug"],
+                org=t["organization"]["slug"],
+                city=(t.get("city") or "").strip(),
+                state=(t.get("state") or "").strip(),
+                regions=list(t.get("regions") or []),
+            )
+            for t in props["trails"]
+        ]
+    except (KeyError, TypeError) as e:
+        raise TrailbotError(f"Unexpected trail entry in /trails data: {e!r}") from e
+    areas = {
+        code: Area(code=code, name=a.get("displayName") or code, regions=dict(a.get("regions") or {}))
+        for code, a in (props.get("areas") or {}).items()
+    }
+    # Some trails use a full name ("Ontario") instead of the code ("ON"); normalize.
+    by_name = {a.name.lower(): code for code, a in areas.items()}
+    for t in trails:
+        t.state = by_name.get(t.state.lower(), t.state.upper())
+    return Index(trails=trails, areas=areas)
+
+
 @dataclass
 class Trail:
+    """A trail with current status, from an org page."""
+
     name: str
     slug: str
     org: str
@@ -50,7 +117,7 @@ class Trail:
     @classmethod
     def from_raw(cls, raw: dict, org: str) -> "Trail":
         return cls(
-            name=raw.get("trailName") or raw.get("slug") or "?",
+            name=(raw.get("trailName") or raw.get("slug") or "?").strip(),
             slug=raw.get("slug") or "",
             org=org,
             status=(raw.get("trailStatus") or "Unknown").strip(),
@@ -74,6 +141,10 @@ class Trail:
             return False
         return None
 
+    @property
+    def location(self) -> str | None:
+        return ", ".join(p for p in (self.city, self.state) if p) or None
+
     def updated_local(self) -> str | None:
         if not self.updated_at_ms:
             return None
@@ -91,12 +162,18 @@ class Trail:
         return "just now"
 
     def summary(self, now: float | None = None) -> str:
-        verdict = {True: "OPEN", False: "CLOSED", None: f"status '{self.status}'"}[
-            self.open_for_riding
-        ]
-        head = f"{self.name} is {verdict}"
+        if self.open_for_riding is None:
+            verdict = (
+                "not marked open or closed on Trailbot (see the maintainer note)"
+                if self.status == "Unknown"
+                else f"marked '{self.status}'"
+            )
+        else:
+            verdict = "OPEN" if self.open_for_riding else "CLOSED"
+        where = f" ({self.location})" if self.location else ""
+        head = f"{self.name}{where} is {verdict}"
         if self.tags:
-            head += f" (conditions: {', '.join(self.tags)})"
+            head += f", conditions: {', '.join(self.tags)}"
         parts = [head + "."]
         if ago := self.updated_ago(now):
             parts.append(f"Status last updated {ago} ({self.updated_local()}).")
@@ -107,101 +184,93 @@ class Trail:
     def to_dict(self, now: float | None = None) -> dict:
         return {
             "name": self.name,
-            "slug": self.slug,
-            "org": self.org,
             "status": self.status,
             "open_for_riding": self.open_for_riding,
             "condition_tags": self.tags,
             "maintainer_note": self.note or None,
             "updated": self.updated_local(),
             "updated_ago": self.updated_ago(now),
-            "location": ", ".join(p for p in (self.city, self.state) if p) or None,
+            "location": self.location,
             "regions": self.regions,
             "precip_last_24h": self.precip_24h,
             "precip_type": self.precip_type,
-            "url": f"{BASE_URL}/trails/{self.org}/{self.slug}" if self.slug else None,
+            "url": f"{BASE_URL}/trails/{quote(self.org)}/{self.slug}" if self.slug else None,
         }
 
 
 def parse_org_page(html: str, org: str) -> list[Trail]:
-    m = _NEXT_DATA_RE.search(html)
-    if not m:
-        raise TrailbotError(f"No __NEXT_DATA__ found on the {org} page; Trailbot's page layout may have changed.")
+    props = _page_props(html, org)
     try:
-        props = json.loads(m.group(1))["props"]["pageProps"]
         raw_trails = props["trails"]
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        raise TrailbotError(f"Unexpected Trailbot page data for {org}: {e!r}") from e
+    except KeyError as e:
+        raise TrailbotError(f"No trails in Trailbot page data for {org}") from e
     return [Trail.from_raw(t, org) for t in raw_trails if t.get("active", True)]
 
 
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+class _TTLCache:
+    """Per-key cache with single-flight fetches and stale fallback on failure."""
 
+    def __init__(self, ttl: float):
+        self.ttl = ttl
+        self._data: dict[str, tuple[float, object]] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
 
-def match_trails(query: str, trails: list[Trail]) -> list[Trail]:
-    """Best-effort fuzzy lookup: exact > all query words present > close spelling."""
-    q = _norm(query)
-    if not q:
-        return []
-    for t in trails:
-        if q in (_norm(t.name), _norm(t.slug)):
-            return [t]
-    words = q.split()
-    hits = [t for t in trails if all(w in _norm(t.name) or w in _norm(t.slug) for w in words)]
-    if hits:
-        return hits
-    names = {_norm(t.name): t for t in trails}
-    close = difflib.get_close_matches(q, names, n=3, cutoff=0.6)
-    if close:
-        return [names[c] for c in close]
-    # Last resort: match any single query word closely against any single name word
-    # (handles "wirth" typos like "worth", or "murphy hanrahan").
-    scored = []
-    for t in trails:
-        name_words = _norm(t.name).split()
-        score = sum(
-            1 for w in words if len(w) > 3 and difflib.get_close_matches(w, name_words, n=1, cutoff=0.8)
-        )
-        if score:
-            scored.append((score, t))
-    if not scored:
-        return []
-    best = max(s for s, _ in scored)
-    return [t for s, t in scored if s == best]
+    async def get(self, key: str, fetch) -> tuple[object, bool]:
+        hit = self._data.get(key)
+        if hit and time.monotonic() - hit[0] < self.ttl:
+            return hit[1], False
+        async with self._locks.setdefault(key, asyncio.Lock()):
+            hit = self._data.get(key)
+            if hit and time.monotonic() - hit[0] < self.ttl:
+                return hit[1], False
+            try:
+                value = await fetch()
+            except (httpx.HTTPError, TrailbotError):
+                if hit:
+                    return hit[1], True
+                raise
+            self._data[key] = (time.monotonic(), value)
+            return value, False
 
 
 class TrailbotClient:
-    def __init__(self, ttl_seconds: float = 300, http: httpx.AsyncClient | None = None):
-        self.ttl = ttl_seconds
+    def __init__(
+        self,
+        ttl_seconds: float = 300,
+        index_ttl_seconds: float = 6 * 3600,
+        max_concurrency: int = 4,
+        http: httpx.AsyncClient | None = None,
+    ):
         self._http = http or httpx.AsyncClient(
             base_url=BASE_URL,
             headers={"User-Agent": USER_AGENT},
             timeout=15,
             follow_redirects=True,
         )
-        self._cache: dict[str, tuple[float, list[Trail]]] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self.org_cache = _TTLCache(ttl_seconds)
+        self.index_cache = _TTLCache(index_ttl_seconds)
+        self._sem = asyncio.Semaphore(max_concurrency)
+
+    async def _get(self, path: str) -> str:
+        async with self._sem:
+            resp = await self._http.get(path)
+        if resp.status_code == 404:
+            raise TrailbotError(f"Trailbot page not found: {path}")
+        resp.raise_for_status()
+        return resp.text
+
+    async def index(self) -> tuple[Index, bool]:
+        """Return (index, stale)."""
+
+        async def fetch():
+            return parse_index(await self._get("/trails"))
+
+        return await self.index_cache.get("index", fetch)
 
     async def trails(self, org: str) -> tuple[list[Trail], bool]:
-        """Return (trails, stale). Serves stale cache if Trailbot is unreachable."""
-        org = org.strip().lower()
-        cached = self._cache.get(org)
-        if cached and time.monotonic() - cached[0] < self.ttl:
-            return cached[1], False
-        async with self._locks.setdefault(org, asyncio.Lock()):
-            cached = self._cache.get(org)
-            if cached and time.monotonic() - cached[0] < self.ttl:
-                return cached[1], False
-            try:
-                resp = await self._http.get(f"/trails/{org}")
-                if resp.status_code == 404:
-                    raise TrailbotError(f"Trailbot has no organization '{org}'.")
-                resp.raise_for_status()
-                trails = parse_org_page(resp.text, org)
-            except (httpx.HTTPError, TrailbotError):
-                if cached:
-                    return cached[1], True
-                raise
-            self._cache[org] = (time.monotonic(), trails)
-            return trails, False
+        """Return (trails with status, stale) for one org."""
+
+        async def fetch():
+            return parse_org_page(await self._get(f"/trails/{quote(org)}"), org)
+
+        return await self.org_cache.get(org, fetch)

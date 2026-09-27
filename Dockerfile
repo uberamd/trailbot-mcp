@@ -8,7 +8,7 @@ COPY src ./src
 RUN uv sync --frozen --no-dev
 RUN useradd --system --uid 10001 app
 USER app
-ENV PORT=8000 TRAILBOT_ORGS=morc
+ENV PORT=8000
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import os,urllib.request;urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/healthz')"
 CMD ["/app/.venv/bin/trailbot-mcp"]
