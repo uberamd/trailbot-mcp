@@ -5,12 +5,12 @@ import pytest
 
 from trailbot_mcp import server
 from trailbot_mcp.lookup import match_trails, resolve_location, split_trail_and_place
-from trailbot_mcp.trailbot import TrailbotClient, TrailbotError, parse_index, parse_org_page
+from trailbot_mcp.trailbot import TrailbotClient, TrailbotError, parse_index, parse_org_trails
 
 FIXTURES = Path(__file__).parent / "fixtures"
-MORC_HTML = (FIXTURES / "morc.html").read_text()
+MORC_JSON = (FIXTURES / "morc_trails.json").read_text()
 INDEX_HTML = (FIXTURES / "index.html").read_text()
-MORC = parse_org_page(MORC_HTML, "morc")
+MORC = parse_org_trails(MORC_JSON, "morc")
 INDEX = parse_index(INDEX_HTML)
 
 
@@ -21,7 +21,7 @@ def names(q, trails=MORC):
 # --- parsing ---------------------------------------------------------------
 
 
-def test_parse_org_page():
+def test_parse_org_trails():
     assert len(MORC) == 19
     rebecca = next(t for t in MORC if t.slug == "lake-rebecca")
     assert rebecca.open_for_riding is False
@@ -37,9 +37,13 @@ def test_parse_index():
     assert {t.state for t in INDEX.trails} >= {"ON"} and "ONTARIO" not in {t.state for t in INDEX.trails}
 
 
-def test_parse_rejects_non_next_page():
+def test_parse_rejects_unexpected_responses():
     with pytest.raises(TrailbotError):
-        parse_org_page("<html>nope</html>", "morc")
+        parse_index("<html>nope</html>")
+    with pytest.raises(TrailbotError):
+        parse_org_trails("<html>nope</html>", "morc")
+    with pytest.raises(TrailbotError):
+        parse_org_trails('{"unexpected": []}', "morc")
 
 
 # --- trail name matching ---------------------------------------------------
@@ -89,7 +93,7 @@ def test_match_across_whole_index(query, expected):
 
 
 def test_no_status_set_points_to_note():
-    t = parse_org_page(MORC_HTML, "morc")[0]
+    t = parse_org_trails(MORC_JSON, "morc")[0]
     t.status, t.note = "Unknown", "All trails are open."
     assert "not marked open or closed" in t.summary() and "All trails are open." in t.summary()
 
@@ -140,8 +144,8 @@ def test_split_trail_and_place():
 def _routes(req: httpx.Request) -> httpx.Response:
     if req.url.path == "/trails":
         return httpx.Response(200, text=INDEX_HTML)
-    if req.url.path == "/trails/morc":
-        return httpx.Response(200, text=MORC_HTML)
+    if req.url.path == "/api/public/organizations/morc/trails":
+        return httpx.Response(200, text=MORC_JSON)
     return httpx.Response(404)
 
 
@@ -155,7 +159,7 @@ async def test_client_caches_and_serves_stale_on_failure():
 
     def handler(req):
         calls["n"] += 1
-        return httpx.Response(503) if calls["fail"] else httpx.Response(200, text=MORC_HTML)
+        return httpx.Response(503) if calls["fail"] else httpx.Response(200, text=MORC_JSON)
 
     c = _mock_client(handler)
     t1, stale1 = await c.trails("morc")
